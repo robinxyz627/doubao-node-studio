@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "豆包节点工作台桥接",
+  "version": "0.7.2",
+  "description": "将本地豆包节点工作台任务提交到已登录的豆包网页，并回传生成状态与媒体结果。",
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "debugger", "alarms", "downloads"],
+  "host_permissions": ["https://*/*", "http://127.0.0.1:4318/*"],
+  "action": { "default_title": "豆包节点工作台", "default_popup": "popup.html" },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.doubao.com/chat*", "https://*.doubao.com/chat*"],
+      "js": ["extractor.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.doubao.com/chat*", "https://*.doubao.com/chat*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

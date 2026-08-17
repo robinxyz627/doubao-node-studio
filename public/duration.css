@@ -1,0 +1,3 @@
+.popover-duration{display:grid;grid-template-columns:auto 72px;gap:5px;align-items:center;color:#aeb2ba;font-size:10px}
+.popover-duration b{color:#f2f3f5}
+.popover-duration input{width:72px;accent-color:#eef0f2}

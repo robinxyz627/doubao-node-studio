@@ -1,0 +1,15 @@
+# User projects and generated local state
+data/
+用户素材库/
+
+# Downloaded runtime and local build outputs
+runtime/
+node_modules/
+dist/
+*.log
+
+# Secrets and editor state
+.env
+.env.*
+.DS_Store
+Thumbs.db

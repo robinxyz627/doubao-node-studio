@@ -1,0 +1,10 @@
+{
+  "name": "doubao-node-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local node workspace and Chrome bridge for Doubao video projects.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check bridge-extension/background.js && node --check bridge-extension/extractor.js && node --check bridge-extension/content.js && node --check bridge-extension/popup.js && node --check public/app.js"
+  }
+}
