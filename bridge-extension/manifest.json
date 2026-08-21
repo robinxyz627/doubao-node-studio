@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "豆包节点工作台桥接",
-  "version": "0.7.2",
+  "version": "0.7.9",
   "description": "将本地豆包节点工作台任务提交到已登录的豆包网页，并回传生成状态与媒体结果。",
   "permissions": ["storage", "activeTab", "scripting", "tabs", "debugger", "alarms", "downloads"],
   "host_permissions": ["https://*/*", "http://127.0.0.1:4318/*"],

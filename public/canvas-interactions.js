@@ -4,7 +4,7 @@
   let cutting = null;
   let suppressContextMenuUntil = 0;
   const edgeKey = (sourceId, targetId) => `${sourceId}:${targetId}`;
-  const nodeModel = (id) => state.canvas.videos.find((item) => item.id === id) || state.canvas.texts.find((item) => item.id === id) || state.canvas.drafts.find((item) => item.id === id) || state.assets.find((item) => item.id === id);
+  const nodeModel = (id) => state.canvas.videos.find((item) => item.id === id) || state.canvas.localVideos?.find((item) => item.id === id) || state.canvas.texts.find((item) => item.id === id) || state.canvas.drafts.find((item) => item.id === id) || state.assets.find((item) => item.id === id);
   const nodePosition = (id) => {
     const model = nodeModel(id); if (!model) return null;
     return state.assets.some((asset) => asset.id === id) ? (state.canvas.images[id] || imagePos(id, state.assets.findIndex((asset) => asset.id === id))) : model;
@@ -125,15 +125,16 @@
     else if (!current.has(id)) { current.clear(); current.add(id); }
     setSelectedNodes([...current]);
   }, true);
-  // 标题栏自己的拖拽监听会在 capture 阶段之后重置 drag；因此在冒泡末尾再建立
-  // 整组的独立坐标快照，避免节点漂移与只移动第一个节点。
+  // fixups.js 的拖拽监听在 capture 阶段创建 drag。这里也必须在 capture 阶段、
+  // 且在“选中当前节点”之后建立整组坐标快照；若放在冒泡阶段，前面的
+  // stopPropagation 会让这段逻辑根本不执行，表现就是框选后只移动首个节点。
   document.addEventListener('pointerdown', (event) => {
     if (event.button !== 0 || event.target.closest?.('.port, button, input, select, [contenteditable], .edge-cut')) return;
     const node = event.target.closest?.('.graph-node'); if (!node || !drag || drag.id !== node.dataset.nodeId) return;
     drag.group = [...selectedIds()].map((nodeId) => {
       const origin = nodePosition(nodeId); return origin ? { id:nodeId, origin:{ x:origin.x, y:origin.y } } : null;
     }).filter(Boolean);
-  });
+  }, true);
   document.addEventListener('pointermove', (event) => {
     if (!drag?.group?.length) return;
     const dx = (event.clientX - drag.startX) / state.view.scale, dy = (event.clientY - drag.startY) / state.view.scale;

@@ -1,4 +1,4 @@
-const DOUBAO_NODE_STUDIO_BUILD = '0.7.2';
+const DOUBAO_NODE_STUDIO_BUILD = '0.7.9';
 const DOUBAO_NODE_STUDIO_PAGE_STATUS = 'DOUBAO_NODE_STUDIO_PAGE_STATUS';
 if (window.__doubaoNodeStudioBridgeInjected === DOUBAO_NODE_STUDIO_BUILD) {
   const duplicateWorker = sessionStorage.getItem('doubao-node-studio-managed-worker') === '1' || /[?&](?:dnst|dnsw)=/.test(location.search);
@@ -129,10 +129,6 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
     accountId = response.data.accountId;
     await new Promise((resolve) => chrome.storage.local.set({ bridgeOrigin:response.data.origin, bridgeKey:response.data.key, accountId, bootstrapToken:'' }, resolve));
     const clean = new URL(location.href); clean.searchParams.delete('dnst'); history.replaceState({}, '', `${clean.pathname}${clean.search}${clean.hash}`);
-    if (urlToken) {
-      const promotion = await promoteBootstrapWindow();
-      if (!promotion?.ok) showBridgeBadge('账号已连接；独立前台窗口创建失败');
-    }
     showBridgeBadge(`豆包工作台已连接 · ${response.data.accountName || '账号容器'}`);
   }
   async function localAsset(url) {
@@ -160,8 +156,25 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
     await wait(520);
     if (draftIsDirty()) throw new Error('新对话创建后输入栏或图片引用仍未清空，已停止提交以避免串用上下文');
   }
-  async function event(job, status, detail, result) { await local(`/api/bridge/jobs/${job.id}/event`, { method:'POST', body:JSON.stringify({ status, detail, result }) }); }
+  async function event(job, status, detail, result, stage, userAction) { await local(`/api/bridge/jobs/${job.id}/event`, { method:'POST', body:JSON.stringify({ status, detail, result, stage, userAction }) }); }
   const pageText = () => document.body?.innerText || '';
+  class UserActionRequired extends Error { constructor(message) { super(message); this.name = 'UserActionRequired'; } }
+  function blockingOverlay() {
+    const overlays = [...document.querySelectorAll('[role="dialog"], [class*="modal" i], [class*="dialog" i], [class*="popup" i], [class*="mask" i]')].filter(isVisible);
+    const words = overlays.map((item) => item.innerText || item.textContent || '').join('\n').replace(/\s+/g, ' ').trim();
+    if (!words) return null;
+    if (/真人(?:认证|识别)|人脸(?:验证|认证)|安全验证|人机验证|验证码|完成验证/.test(words)) return { kind:'verification', title:'豆包要求真人/安全验证', resumeStep:'restart', instructions:'请在置顶的豆包窗口完成真人或安全验证；完成后回到工作台点击「我已处理，继续」。' };
+    if (/(?:下载|安装|打开).{0,12}(?:豆包|Windows|客户端|桌面版)|推荐.{0,12}(?:客户端|桌面版)/.test(words)) return { kind:'client_prompt', title:'豆包客户端推荐弹窗遮挡页面', resumeStep:'restart', instructions:'请在豆包窗口关闭或跳过客户端推荐弹窗；不要改变已选模型、比例和图片，然后点击「我已处理，继续」。' };
+    return null;
+  }
+  async function pauseForUser(job, stage, action) {
+    const detail = action.instructions || '豆包页面需要人工处理后才能继续。';
+    await event(job, 'awaiting_user', detail, null, stage, action);
+    reportStatus({ state:'等待人工处理', detail:`${stage}：${action.title}`, activeJob:null, lastError:null });
+    throw new UserActionRequired(detail);
+  }
+  async function requireClearPage(job, stage) { const action = blockingOverlay(); if (action) await pauseForUser(job, stage, action); }
+  async function reportStage(job, stage, detail) { await event(job, 'dispatching', detail, null, stage); reportStatus({ state:'正在处理任务', detail:`${stage}：${detail}`, activeJob:job.id, lastError:null }); }
   const buttons = () => [...document.querySelectorAll('button')];
   const isVisible = (element) => !!element && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length) && getComputedStyle(element).visibility !== 'hidden';
   const normalizedText = (value) => String(value || '').replace(/\s/g, '');
@@ -169,8 +182,17 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
   const visibleButtonByText = (text) => [...document.querySelectorAll('button,[role="menuitem"],[role="button"]')].find((button) => isVisible(button) && normalizedText(button.textContent) === normalizedText(text));
   const visibleControl = (selector) => [...document.querySelectorAll(selector)].find(isVisible);
   const requestWorkerFocus = () => new Promise((resolve) => chrome.runtime.sendMessage({ type:FOCUS_WORKER_MESSAGE }, (response) => resolve(Boolean(response?.ok))));
-  async function waitForVideoControl() {
+  async function bringTaskWindowToFront() {
+    // 必须先激活“收到本任务的这个 tab”，再提升其所属账号窗口。服务端会
+    // 连续执行三次 Windows 置顶，覆盖 Chrome 接管焦点与页面刚恢复渲染的时点。
+    await requestWorkerFocus();
+    if (accountId && managedWorker) await local(`/api/bridge/accounts/${encodeURIComponent(accountId)}/foreground`, { method:'POST', body:'{}' }).catch(() => {});
+    await wait(480);
+    await requestWorkerFocus();
+  }
+  async function waitForVideoControl(job) {
     for (let attempt = 0; attempt < 32; attempt += 1) {
+      await requireClearPage(job, '切换视频生成');
       const model = visibleControl('button[data-input-engine-actionbar-control-key="video-model"]');
       if (model) return model;
       const mode = visibleButtonByText('视频生成');
@@ -184,7 +206,9 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
     for (let round = 0; round < 3; round += 1) {
       if (params.getAttribute('aria-expanded') !== 'true') await nativeClick(params);
       for (let attempt = 0; attempt < 25; attempt += 1) {
-        const panel = [...document.querySelectorAll('[role="menu"]')].find((item) => isVisible(item) && item.textContent.includes('比例') && item.textContent.includes('时长'));
+        // 豆包存在两套参数 UI：一套为 role=menu 的“比例/时长”面板，另一套
+        // 是底部上拉栏。两者都必须同时识别到画幅与时长线索才算已展开。
+        const panel = [...document.querySelectorAll('[role="menu"], [role="dialog"], [class*="popover" i], [class*="panel" i], [class*="sheet" i]')].find((item) => isVisible(item) && /比例|16:9|9:16|1:1/.test(item.textContent) && /时长|\d+\s*(?:s|秒)/i.test(item.textContent));
         if (panel) return panel;
         await wait(80);
       }
@@ -193,18 +217,36 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
     }
     return null;
   }
+  async function setAspect(job, params, aspect) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await requireClearPage(job, '设置画幅比例');
+      await requestWorkerFocus(); await wait(260);
+      const panel = await openParams(params);
+      const option = panel && [...panel.querySelectorAll('button,[role="button"],[role="radio"],[role="option"],label,div')].find((button) => isVisible(button) && normalizedText(button.textContent) === normalizedText(aspect));
+      if (!option) await pauseForUser(job, '设置画幅比例', { kind:'missing_aspect', resumeStep:'upload_assets', title:`未找到可选比例 ${aspect}`, instructions:`豆包当前页面没有识别到 ${aspect}。请检查是否有参数上拉栏、是否被弹窗遮挡；手动选好 ${aspect} 后点击「我已处理，继续」。` });
+      await nativeClick(option); await wait(420);
+      // 展开的参数面板本身也会含有全部比例文字，不能在展开态检查文本。
+      // 先明确收起，再读取豆包底部的已选摘要，例如“16:9 · 10s”。
+      if (params.getAttribute('aria-expanded') === 'true') { await nativeClick(params); await wait(260); }
+      const summary = normalizedText(params.textContent);
+      if (summary.includes(normalizedText(aspect)) && (aspect !== '自动' || !/[0-9]+:[0-9]+/.test(summary))) return;
+      await requestWorkerFocus(); await wait(260);
+    }
+    await pauseForUser(job, '校验画幅比例', { kind:'aspect_unconfirmed', resumeStep:'upload_assets', title:`豆包未确认 ${aspect}`, instructions:`请在豆包窗口手动确认比例已为 ${aspect}，再点击「我已处理，继续」。页面摘要：${params.textContent.trim() || '未识别'}` });
+  }
   async function activateVideoGeneration(job) {
-    const model = await waitForVideoControl(); if (!model) throw new Error('等待 10 秒后仍未切换到豆包视频生成模式');
-    if (!/Seedance\s*2\.0\s*Fast/i.test(model.textContent)) { await nativeClick(model); await wait(120); const fast = [...document.querySelectorAll('[role="menuitem"]')].find((item) => isVisible(item) && /Seedance\s*2\.0\s*Fast/i.test(item.textContent)); if (!fast) throw new Error('豆包页面未提供 Seedance 2.0 Fast'); await nativeClick(fast); await wait(160); }
-    const params = visibleControl('button[data-creation-params-panel-id]'); const aspect = job.aspect || '自动';
-    if (!params) throw new Error('未找到可见的豆包视频比例与时长设置');
-    const aspectPanel = await openParams(params); const option = aspectPanel && [...aspectPanel.querySelectorAll('button,[role="button"]')].find((button) => normalizedText(button.textContent) === normalizedText(aspect)); if (!option) { const menus = [...document.querySelectorAll('[role="menu"]')].filter(isVisible).map((item) => normalizedText(item.innerText).slice(0, 100)).join(' | '); throw new Error(`未在已展开的豆包比例面板中找到 ${aspect}（脚本 ${DOUBAO_NODE_STUDIO_BUILD}；可见菜单：${menus || '无'}）`); } await nativeClick(option); await wait(180);
+    await reportStage(job, '切换视频生成', '正在确认豆包视频生成模式');
+    const model = await waitForVideoControl(job); if (!model) await pauseForUser(job, '切换视频生成', { kind:'missing_video_mode', resumeStep:'upload_assets', title:'未找到视频生成控件', instructions:'请打开豆包窗口，手动进入「视频生成」模式并关闭遮挡弹窗，然后点击「我已处理，继续」。' });
+    if (!/Seedance\s*2\.0\s*Fast/i.test(model.textContent)) { await nativeClick(model); await wait(120); const fast = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, div')].find((item) => isVisible(item) && /Seedance\s*2\.0\s*Fast/i.test(item.textContent)); if (!fast) await pauseForUser(job, '选择视频模型', { kind:'missing_model', resumeStep:'upload_assets', title:'未识别到 Seedance 2.0 Fast', instructions:'请在豆包窗口手动选择 Seedance 2.0 Fast，并确认仍处于视频生成模式后点击「我已处理，继续」。' }); await nativeClick(fast); await wait(160); }
+    const params = visibleControl('button[data-creation-params-panel-id]') || buttons().find((button) => isVisible(button) && /(?:自动|\d+:\d+).*(?:\d+\s*(?:s|秒)|时长)|(?:时长|比例).*(?:自动|\d+:\d+)/i.test(button.textContent || '')); const aspect = job.aspect || '自动';
+    if (!params) await pauseForUser(job, '设置视频参数', { kind:'missing_params', resumeStep:'upload_assets', title:'未找到比例/时长入口', instructions:'豆包可能使用了另一版参数栏。请手动选择正确的比例和时长，确认页面无遮挡后点击「我已处理，继续」。' });
+    await reportStage(job, '设置画幅比例', `正在选择 ${aspect}`); await setAspect(job, params, aspect);
     const requestedDuration = Math.min(10, Math.max(4, Number.parseInt(String(job.sourceDuration || '10').replace(/\D/g, ''), 10) || 10));
     // 豆包默认即为 10 秒：默认任务不触碰滑条，避免无意义的额外页面操作。
     if (requestedDuration !== 10) {
-      const durationPanel = await openParams(params);
+      await reportStage(job, '设置视频时长', `正在选择 ${requestedDuration}s`); await requireClearPage(job, '设置视频时长'); const durationPanel = await openParams(params);
       const slider = durationPanel?.querySelector('input[type="range"]') || durationPanel?.querySelector('[role="slider"]');
-      if (!slider) throw new Error('未找到豆包的视频时长滑条（已检查原生与自定义滑条）');
+      if (!slider) await pauseForUser(job, '设置视频时长', { kind:'missing_duration', resumeStep:'upload_assets', title:'未找到时长滑条', instructions:`请在豆包窗口的参数面板中手动选择 ${requestedDuration}s，确认后点击「我已处理，继续」。` });
       const scale = durationScale(durationPanel, slider);
       if (requestedDuration < scale.visibleMin || requestedDuration > scale.visibleMax) throw new Error(`当前豆包时长滑条显示范围为 ${scale.visibleMin}–${scale.visibleMax}s，无法设置 ${requestedDuration}s`);
       const rawTarget = scale.rawMin + (requestedDuration - scale.visibleMin) * (scale.rawMax - scale.rawMin) / (scale.visibleMax - scale.visibleMin);
@@ -219,9 +261,28 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
       }
       await wait(360);
       const settled = sliderSeconds(slider, scale);
-      if (Number.isFinite(settled) && Math.abs(settled - requestedDuration) > .6) throw new Error(`豆包时长未设置成功：请求 ${requestedDuration}s，页面当前为 ${settled}s`);
+      if (Number.isFinite(settled) && Math.abs(settled - requestedDuration) > .6) await pauseForUser(job, '校验视频时长', { kind:'duration_unconfirmed', resumeStep:'upload_assets', title:`豆包未确认 ${requestedDuration}s`, instructions:`请手动确认时长为 ${requestedDuration}s 后点击「我已处理，继续」。页面当前识别为 ${settled}s。` });
     }
     if (params.getAttribute('aria-expanded') === 'true') await nativeClick(params); await wait(100);
+  }
+  async function verifyGenerationSettings(job) {
+    await requireClearPage(job, '提交前复核');
+    const expectedAspect = job.aspect || '自动';
+    const expectedDuration = Math.min(10, Math.max(4, Number.parseInt(String(job.sourceDuration || '10').replace(/\D/g, ''), 10) || 10));
+    const model = visibleControl('button[data-input-engine-actionbar-control-key="video-model"]') || buttons().find((button) => isVisible(button) && /Seedance\s*2\.0/i.test(button.textContent || ''));
+    const params = visibleControl('button[data-creation-params-panel-id]') || buttons().find((button) => isVisible(button) && /(?:自动|\d+:\d+).*(?:\d+\s*(?:s|秒)|时长)|(?:时长|比例).*(?:自动|\d+:\d+)/i.test(button.textContent || ''));
+    if (params?.getAttribute('aria-expanded') === 'true') { await nativeClick(params); await wait(220); }
+    const modelSummary = normalizedText(model?.textContent || '');
+    const parameterSummary = normalizedText(params?.textContent || '');
+    const modelOk = /Seedance2\.0Fast/i.test(modelSummary);
+    const aspectOk = expectedAspect === '自动' ? parameterSummary.includes('自动') && !/[0-9]+:[0-9]+/.test(parameterSummary) : parameterSummary.includes(normalizedText(expectedAspect));
+    const durationOk = new RegExp(`${expectedDuration}(?:s|秒)`, 'i').test(parameterSummary);
+    if (modelOk && aspectOk && durationOk) {
+      await reportStage(job, '提交前复核通过', `已确认 Seedance 2.0 Fast · ${expectedAspect} · ${expectedDuration}s`);
+      return;
+    }
+    const detected = `模型「${model?.textContent?.trim() || '未识别'}」，参数「${params?.textContent?.trim() || '未识别'}」`;
+    await pauseForUser(job, '提交前复核', { kind:'settings_unconfirmed', resumeStep:'ready_to_submit', title:'豆包页面参数未通过提交前复核', instructions:`期望：Seedance 2.0 Fast · ${expectedAspect} · ${expectedDuration}s。当前检测到：${detected}。请在豆包窗口手动修正并收起参数面板，再点击「我已处理，继续」。` });
   }
   function setPrompt(value) {
     const editor = document.querySelector('[contenteditable="true"][role="textbox"].tiptap, [contenteditable="true"].ProseMirror');
@@ -229,9 +290,9 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
     const textarea = document.querySelector('textarea'); if (!textarea) throw new Error('未找到豆包视频提示词输入框'); const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set; setter.call(textarea,value); textarea.dispatchEvent(new Event('input',{bubbles:true})); textarea.dispatchEvent(new Event('change',{bubbles:true}));
   }
   async function setFiles(job) {
-    const input=document.querySelector('input[type="file"][accept*=".jpg"],input[type="file"]'); if(!input) throw new Error('未找到豆包图片上传入口');
-    const transfer=new DataTransfer(); for(const asset of job.assets){ try { const blob=await localAsset(`${job.bridgeOrigin}${asset.url}`); transfer.items.add(new File([blob],`${asset.name}.${asset.mime.split('/')[1].replace('jpeg','jpg')}`,{type:asset.mime})); } catch (error) { throw new Error(`读取参考图「${asset.name}」失败：${error.message || error}`); } }
-    input.files=transfer.files; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); await wait(450);
+    const input=document.querySelector('input[type="file"][accept*=".jpg"],input[type="file"]'); if(!input) await pauseForUser(job, '上传参考图片', { kind:'missing_upload', resumeStep:'restart', title:'未找到图片上传入口', instructions:'请在豆包窗口关闭弹窗并手动展开图片上传入口；无需上传图片，完成后回到工作台点击「我已处理，继续」。' });
+    for(const asset of job.assets){ try { await requestWorkerFocus(); await wait(260); const blob=await localAsset(`${job.bridgeOrigin}${asset.url}`); const transfer=new DataTransfer(); transfer.items.add(new File([blob],`${asset.name}.${asset.mime.split('/')[1].replace('jpeg','jpg')}`,{type:asset.mime})); input.files=transfer.files; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true})); await wait(320); } catch (error) { throw new Error(`读取参考图「${asset.name}」失败：${error.message || error}`); } }
+    await wait(360);
   }
   function findSendButton() { return document.querySelector('#flow-end-msg-send:not([disabled]):not([aria-disabled="true"])') || buttons().find((button) => button.type === 'submit' && !button.disabled && button.getAttribute('aria-hidden') !== 'true' && !button.closest('#doubao-assistant-root')); }
   function latestMedia() { const candidates=[...document.querySelectorAll('video,video source,a[href*=".mp4"],a[href*="video"]')];for(const element of candidates.reverse()){const value=element.currentSrc||element.src||element.href;if(value&&/^https?:/.test(value))return value;}return null; }
@@ -243,8 +304,51 @@ window.__doubaoNodeStudioBridgeInjected = DOUBAO_NODE_STUDIO_BUILD;
   function startMonitoring(context) { activeJob=context; clearInterval(monitor); monitor=setInterval(()=>monitorJob(context).catch((error)=>reportStatus({ state:'正在生成', detail:'等待豆包结果', lastError:error?.message || String(error), activeJob:context.job.id })),2500); }
   async function resumeSubmittedJob() { const response=await local('/api/bridge/active'); if(!response.data.job || activeJob)return false; const context={job:response.data.job,baseline:pageText()}; startMonitoring(context); reportStatus({ state:'正在生成', detail:`已恢复 ${context.job.id} 的结果监听`, activeJob:context.job.id, lastError:null }); return true; }
   async function recoverPendingDownload() { if(Date.now()-lastRecovery<30000)return false; const response=await local('/api/bridge/download-pending'); const job=response.data.job; if(!job)return false; lastRecovery=Date.now(); reportStatus({ state:'正在保存无水印成片', detail:`正在补充解析 ${job.id} 的原始成片地址`, activeJob:job.id, lastError:null }); const downloaded=await downloadIfAvailable(job).catch(()=>null); if(downloaded?.savedAs){await event(job,'succeeded',`生成成功，已保存至 ${downloaded.savedAs}`,downloaded.result);reportStatus({state:'已连接豆包页面',detail:`已补充保存 ${job.id} 的无水印成片`,activeJob:null,lastError:null});return true;} reportStatus({state:'已连接豆包页面',detail:'未解析到原始成片地址；将在页面数据更新后自动重试',activeJob:null,lastError:null});return false; }
-  async function dispatch(job) { try { reportStatus({ state:'正在处理任务', detail:`正在置顶豆包任务页并处理 ${job.id}`, activeJob:job.id, lastError:null }); await requestWorkerFocus(); await wait(260); await ensureCleanConversation(); await activateVideoGeneration(job); await setFiles(job); setPrompt(job.expandedPrompt); await event(job,'prepared',`已新建独立对话，切换视频生成、设置 ${job.aspect || '自动'}、上传图片并填入提示词`); const send=findSendButton(); if(!send){await event(job,'prepared','已填入视频生成面板；未找到发送箭头，请在豆包网页检查后手动发送'); reportStatus({ state:'已连接豆包页面', detail:'任务已填入，等待网页端手动发送', activeJob:null });return;} const baseline=pageText(); const baselineUrl=location.href; await nativeClick(send); let confirmed=false; for(let attempt=0;attempt<16;attempt+=1){await wait(250);const delta=textSinceSubmit({baseline});if(/视频生成已提交|正在为您生成|预计等待\s*\d+\s*分钟/.test(delta) || location.href!==baselineUrl && /\/chat\/\d+/.test(location.pathname)){confirmed=true;break;}} if(!confirmed){await event(job,'prepared','发送箭头已触发，但豆包未返回“视频生成已提交”回执；任务仍等待网页确认'); reportStatus({ state:'已连接豆包页面', detail:'发送未获豆包回执，未标记为已提交', activeJob:null }); return;} const context={job,baseline}; await event(job,'submitted','豆包已确认视频生成提交，节点进入生成中'); if(accountId) chrome.runtime.sendMessage({ type:SPAWN_WORKER_MESSAGE, accountId }, () => {}); startMonitoring(context); reportStatus({ state:'正在生成', detail:`豆包已确认 ${job.id}，等待结果`, activeJob:job.id }); } catch(error) { await event(job,'failed',error.message||String(error)); activeJob=null; reportStatus({ state:'豆包页面已连接，但任务失败', detail:error.message||String(error), lastError:error.message||String(error), activeJob:null }); } }
+  async function dispatch(job) { try { reportStatus({ state:'正在处理任务', detail:`正在激活豆包任务页并处理 ${job.id}`, activeJob:job.id, lastError:null }); await bringTaskWindowToFront(); await ensureCleanConversation(); await bringTaskWindowToFront(); await activateVideoGeneration(job); await bringTaskWindowToFront(); await setFiles(job); await bringTaskWindowToFront(); setPrompt(job.expandedPrompt); await wait(320); await event(job,'prepared',`已新建独立对话，切换视频生成、设置 ${job.aspect || '自动'}、逐张上传图片并填入提示词`); const send=findSendButton(); if(!send){await event(job,'prepared','已填入视频生成面板；未找到发送箭头，请在豆包网页检查后手动发送'); reportStatus({ state:'已连接豆包页面', detail:'任务已填入，等待网页端手动发送', activeJob:null });return;} const baseline=pageText(); const baselineUrl=location.href; await bringTaskWindowToFront(); await nativeClick(send); let confirmed=false; for(let attempt=0;attempt<16;attempt+=1){await wait(250);const delta=textSinceSubmit({baseline});if(/视频生成已提交|正在为您生成|预计等待\s*\d+\s*分钟/.test(delta) || location.href!==baselineUrl && /\/chat\/\d+/.test(location.pathname)){confirmed=true;break;}} if(!confirmed){await event(job,'prepared','发送箭头已触发，但豆包未返回“视频生成已提交”回执；任务仍等待网页确认'); reportStatus({ state:'已连接豆包页面', detail:'发送未获豆包回执，未标记为已提交', activeJob:null }); return;} const context={job,baseline}; await event(job,'submitted','豆包已确认视频生成提交，节点进入生成中'); if(accountId) chrome.runtime.sendMessage({ type:SPAWN_WORKER_MESSAGE, accountId }, () => {}); startMonitoring(context); reportStatus({ state:'正在生成', detail:`豆包已确认 ${job.id}，等待结果`, activeJob:job.id }); } catch(error) { await event(job,'failed',error.message||String(error)); activeJob=null; reportStatus({ state:'豆包页面已连接，但任务失败', detail:error.message||String(error), lastError:error.message||String(error), activeJob:null }); } }
   async function poll() { if(!managedWorker || polling || activeJob)return;polling=true;try{if(await resumeSubmittedJob())return;if(await recoverPendingDownload())return;const response=await local('/api/bridge/next'); reportStatus({ state:'已连接豆包页面', detail:'正在等待本机任务', activeJob:null, lastError:null }); if(response.data.job)await dispatch(response.data.job);}catch(error){reportStatus({ state:'豆包页面已连接，但本机轮询失败', detail:error?.message || String(error), lastError:error?.message || String(error), activeJob:null });}finally{polling=false;} }
+  async function dispatchStaged(job) {
+    try {
+      const resumeStep = String(job.resumeStep || 'restart'); delete job.resumeStep;
+      await reportStage(job, '唤醒账号窗口', '正在激活本次任务的豆包标签页');
+      await bringTaskWindowToFront(); await requireClearPage(job, '唤醒账号窗口');
+      const resumeAtSubmit = resumeStep === 'ready_to_submit';
+      if (!resumeAtSubmit && resumeStep !== 'upload_assets') {
+        await reportStage(job, '创建独立对话', '正在清空历史上下文');
+        try { await ensureCleanConversation(); } catch (_) { await pauseForUser(job, '创建独立对话', { kind:'conversation_not_clean', resumeStep:'restart', title:'新对话未清空', instructions:'请在豆包窗口新建并确认空白对话，关闭提示弹窗后点击「我已处理，继续」。' }); }
+        await bringTaskWindowToFront(); await requireClearPage(job, '切换视频生成');
+        await activateVideoGeneration(job);
+      } else if (!resumeAtSubmit) {
+        await reportStage(job, '沿用人工确认的参数', '保留当前页面的模型、比例与时长设置');
+        await requireClearPage(job, '沿用人工确认的参数');
+      }
+      if (!resumeAtSubmit) {
+        await bringTaskWindowToFront(); await reportStage(job, '上传参考图片', `正在逐张上传 ${job.assets.length} 张参考图`); await requireClearPage(job, '上传参考图片'); await setFiles(job);
+        await bringTaskWindowToFront(); await reportStage(job, '填入提示词', '正在写入已展开的图号提示词'); await requireClearPage(job, '填入提示词'); setPrompt(job.expandedPrompt); await wait(320);
+      } else await reportStage(job, '沿用已填内容', '保留人工修正后的模型、参数、图片与提示词');
+      await reportStage(job, '提交前复核', '正在核对模型、比例与时长'); await verifyGenerationSettings(job); await requireClearPage(job, '校验并发送');
+      const send = findSendButton();
+      if (!send) await pauseForUser(job, '等待发送', { kind:'missing_send', resumeStep:'restart', canConfirmSent:true, title:'未找到豆包发送箭头', instructions:'请检查图片、提示词、比例和时长。若你已手动点击豆包发送箭头，点「我已在网页发送」；否则处理页面提示后点「我已处理，继续」。' });
+      const baseline = pageText(); const baselineUrl = location.href;
+      await bringTaskWindowToFront(); await nativeClick(send);
+      let confirmed = false;
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        await wait(250); await requireClearPage(job, '等待提交回执');
+        const delta = textSinceSubmit({ baseline });
+        if (/视频生成已提交|正在为您生成|预计等待\s*\d+\s*分钟/.test(delta) || location.href !== baselineUrl && /\/chat\/\d+/.test(location.pathname)) { confirmed = true; break; }
+      }
+      if (!confirmed) await pauseForUser(job, '等待提交回执', { kind:'submit_unconfirmed', resumeStep:'restart', canConfirmSent:true, title:'发送动作未获得豆包回执', instructions:'请在豆包窗口确认是否已经开始生成：已开始则点「我已在网页发送」恢复监听；未开始则处理页面提示后点「我已处理，继续」。' });
+      const context = { job, baseline };
+      await event(job, 'submitted', '豆包已确认视频生成提交，节点进入生成中', null, '等待生成结果');
+      if (accountId) chrome.runtime.sendMessage({ type:SPAWN_WORKER_MESSAGE, accountId }, () => {});
+      startMonitoring(context); reportStatus({ state:'正在生成', detail:`豆包已确认 ${job.id}，等待结果`, activeJob:job.id });
+    } catch (error) {
+      if (error instanceof UserActionRequired) { activeJob = null; return; }
+      await event(job, 'failed', error.message || String(error), null, '自动化异常'); activeJob = null;
+      reportStatus({ state:'豆包页面已连接，但任务失败', detail:error.message || String(error), lastError:error.message || String(error), activeJob:null });
+    }
+  }
+  // 新版流程从这里进入；旧 dispatch 保留在文件中仅用于兼容已注入的旧页面。
+  dispatch = dispatchStaged;
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => { if (message?.type !== 'DOUBAO_NODE_STUDIO_WAKE') return undefined; reportStatus({ state:'已连接豆包页面', detail:activeJob ? '收到后台唤醒，正在检查本任务结果' : '收到后台唤醒，正在检查任务', activeJob:activeJob?.job?.id || null }); const work = activeJob ? monitorJob(activeJob) : poll(); work.catch((error) => reportStatus({ state:'桥接检查失败', detail:error?.message || String(error), activeJob:activeJob?.job?.id || null })).finally(() => sendResponse({ ok:true })); return true; });
   bootstrapAccount().then(() => {
     reportStatus({ state:'已连接豆包页面', detail:accountId ? (managedWorker ? '账号容器 Worker 已就绪，正在等待本机任务' : '历史豆包页已连接，不参与任务调度') : '桥接脚本已注入，正在等待本机任务', activeJob:null, lastError:null });
